@@ -1,0 +1,28 @@
+# Downloaded epic directories (pattern: EPIC-123/)
+*/
+!prompts/
+
+# Config files with credentials
+config.json
+
+# Temporary analysis outputs
+epic-summary.txt
+*-summary.txt
+
+# Python artifacts
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Editor and AI agent files
+.claude/
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Backup files
+*.bak
+*~

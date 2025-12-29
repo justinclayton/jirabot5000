@@ -1,0 +1,556 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "requests>=2.31.0",
+# ]
+# ///
+"""
+jirabot5000 - Pull all tickets under a Jira epic and optionally analyze with Claude
+
+Usage:
+  ./jirabot5000 <EPIC_KEY>                    # Download + format + prompt for analysis
+  JIRABOT_DOWNLOAD_ONLY=1 ./jirabot5000 <KEY> # Download only (legacy mode)
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+import requests
+
+
+# Analysis prompt embedded in script
+ANALYSIS_PROMPT = """# Jira Epic Analysis
+
+I need you to analyze the following Jira epic tickets and provide:
+
+1. **Progress Summary**
+   - Total tickets and breakdown by status (Done/In Progress/To Do)
+   - Completion percentage
+   - Categorized lists of tickets by status
+
+2. **Blockers & Risks**
+   - Unassigned tickets
+   - Stuck or stale tickets (no recent activity)
+   - Dependencies and issues mentioned
+   - Concerning patterns
+
+3. **Key Decisions & Updates**
+   - Important information from recent comments (last 30 days)
+   - Significant decisions or direction changes
+   - Action items mentioned
+
+4. **Recommendations**
+   - Suggested next actions
+   - Areas needing attention
+
+Please provide a structured, scannable summary with clear headings and visual indicators (✓ → ⚠).
+"""
+
+
+def extract_text(content_node):
+    """Recursively extract text from Confluence document format."""
+    if not content_node:
+        return ""
+
+    if isinstance(content_node, dict):
+        text = ""
+
+        # Handle text nodes
+        if content_node.get('type') == 'text':
+            return content_node.get('text', '')
+
+        # Handle mentions
+        if content_node.get('type') == 'mention':
+            return f"@{content_node.get('attrs', {}).get('text', 'user')}"
+
+        # Handle links
+        if content_node.get('type') == 'inlineCard':
+            url = content_node.get('attrs', {}).get('url', '[link]')
+            return f"[{url}]"
+
+        # Handle hardBreak
+        if content_node.get('type') == 'hardBreak':
+            return '\n'
+
+        # Recursively process content arrays
+        if 'content' in content_node:
+            for child in content_node['content']:
+                text += extract_text(child)
+
+            # Add spacing for paragraphs and list items
+            if content_node.get('type') in ['paragraph', 'listItem']:
+                text += '\n'
+
+        # Handle marks (like links in text)
+        marks = content_node.get('marks', [])
+        for mark in marks:
+            if mark.get('type') == 'link':
+                href = mark.get('attrs', {}).get('href')
+                if href:
+                    text += f" ({href})"
+
+        return text
+
+    elif isinstance(content_node, list):
+        return ''.join(extract_text(item) for item in content_node)
+
+    return str(content_node)
+
+
+def format_ticket(ticket_data):
+    """Format a single ticket for analysis."""
+    fields = ticket_data['fields']
+
+    # Extract basic info
+    key = ticket_data['key']
+    summary = fields.get('summary', 'No summary')
+
+    # Extract status
+    status = fields.get('status', {})
+    status_name = status.get('name', 'Unknown')
+    status_category = status.get('statusCategory', {}).get('key', 'unknown')
+
+    # Map status category to readable name
+    status_map = {
+        'done': 'Done',
+        'new': 'To Do',
+        'indeterminate': 'In Progress'
+    }
+    status_readable = status_map.get(status_category, status_category)
+
+    # Extract assignee
+    assignee = fields.get('assignee')
+    assignee_name = assignee.get('displayName', 'Unassigned') if assignee else 'Unassigned'
+
+    # Extract description
+    description = extract_text(fields.get('description', {}))
+
+    # Extract comments
+    comments = fields.get('comment', {}).get('comments', [])
+
+    output = f"""
+## {key}: {summary}
+
+**Status:** {status_name} ({status_readable})
+**Assignee:** {assignee_name}
+
+### Description
+{description.strip() or '(No description)'}
+"""
+
+    if comments:
+        output += "\n### Comments\n"
+        for comment in comments:
+            author = comment.get('author', {}).get('displayName', 'Unknown')
+            created = comment.get('created', '')
+            body = extract_text(comment.get('body', {}))
+
+            # Parse date for readability
+            try:
+                dt = datetime.fromisoformat(created.replace('Z', '+00:00'))
+                date_str = dt.strftime('%Y-%m-%d')
+            except:
+                date_str = created
+
+            output += f"\n**{author}** ({date_str}):\n{body.strip()}\n"
+
+    return output
+
+
+def load_config():
+    """Load Jira configuration from config.json"""
+    with open('config.json', 'r') as f:
+        return json.load(f)
+
+
+def get_epic_details(jira_instance, email, api_token, epic_key):
+    """Get the epic's details and save to JSON"""
+    url = f"https://{jira_instance}/rest/api/3/issue/{epic_key}"
+    auth = (email, api_token)
+    headers = {"Accept": "application/json"}
+
+    response = requests.get(url, auth=auth, headers=headers)
+    response.raise_for_status()
+
+    data = response.json()
+    return data
+
+
+def get_tickets_in_epic(jira_instance, email, api_token, epic_key):
+    """Get all tickets linked to the epic"""
+    # Use the new JQL search endpoint with nextPageToken pagination
+    auth = (email, api_token)
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+    }
+
+    jql = f'parent = {epic_key}'
+    url = f"https://{jira_instance}/rest/api/3/search/jql"
+
+    all_issues = []
+    next_page_token = None
+    max_results = 50
+
+    while True:
+        # The new endpoint uses POST with JSON body and nextPageToken pagination
+        payload = {
+            'jql': jql,
+            'maxResults': max_results,
+            'fields': ['summary', 'description', 'status', 'assignee', 'comment']
+        }
+
+        # Add nextPageToken if we have one (for subsequent pages)
+        if next_page_token:
+            payload['nextPageToken'] = next_page_token
+
+        response = requests.post(url, auth=auth, headers=headers, json=payload)
+
+        # If we get an error, try to show more details
+        if not response.ok:
+            try:
+                error_detail = response.json()
+                print(f"API Error: {response.status_code}")
+                print(f"Details: {json.dumps(error_detail, indent=2)}")
+            except:
+                print(f"API Error: {response.status_code} - {response.text}")
+            response.raise_for_status()
+
+        data = response.json()
+
+        # The response uses 'issues' for the new /search/jql endpoint
+        all_issues.extend(data.get('issues', []))
+
+        # Check if there are more results
+        if data.get('isLast', True):
+            break
+
+        next_page_token = data.get('nextPageToken')
+        if not next_page_token:
+            break
+
+    return all_issues
+
+
+def format_epic(epic_dir: Path) -> Path:
+    """Format tickets to summary.md using embedded formatting logic."""
+    summary_path = epic_dir / "summary.md"
+
+    print("\nFormatting epic summary...")
+
+    try:
+        # Find all JSON files
+        json_files = sorted(epic_dir.glob('*.json'))
+
+        if not json_files:
+            raise ValueError(f"No JSON files found in {epic_dir}")
+
+        # Build the formatted output
+        output_lines = [
+            f"# Epic Analysis: {epic_dir.name}",
+            f"\nTotal tickets: {len(json_files)}\n",
+            "---\n"
+        ]
+
+        # Process each ticket
+        for json_file in json_files:
+            try:
+                with open(json_file, 'r') as f:
+                    ticket_data = json.load(f)
+                output_lines.append(format_ticket(ticket_data))
+                output_lines.append("\n---\n")
+            except Exception as e:
+                print(f"Warning: Error processing {json_file.name}: {e}", file=sys.stderr)
+
+        # Save the output
+        output_text = '\n'.join(output_lines)
+        summary_path.write_text(output_text)
+
+        # Count lines for user feedback
+        line_count = len(output_text.splitlines())
+        print(f"  ✓ Saved to {summary_path} ({line_count:,} lines)")
+
+        return summary_path
+
+    except Exception as e:
+        print(f"Error formatting epic: {e}", file=sys.stderr)
+        raise
+
+
+def prompt_for_analysis() -> bool:
+    """Interactive prompt: Run Claude analysis?"""
+    try:
+        response = input("\nRun Claude analysis? (Y/n): ").strip().lower()
+        return response in ("", "y", "yes")
+    except (KeyboardInterrupt, EOFError):
+        print()  # New line after Ctrl+C
+        return False
+
+
+def extract_summary_stats(analysis: str) -> dict:
+    """Parse key stats from analysis for console output."""
+    stats = {
+        'done_count': None,
+        'in_progress_count': None,
+        'total_count': None,
+        'completion_pct': None,
+        'unassigned_count': None,
+        'blocker': None
+    }
+
+    # Try to extract some key numbers
+    # Look for patterns like "5 tickets done (42%)"
+    done_match = re.search(r'(\d+)\s+tickets?\s+done|Done:\s*(\d+)', analysis, re.IGNORECASE)
+    if done_match:
+        stats['done_count'] = int(done_match.group(1) or done_match.group(2))
+
+    # Look for "3 in progress" or "In Progress: 3"
+    progress_match = re.search(r'(\d+)\s+(?:tickets?\s+)?in\s+progress|In\s+Progress:\s*(\d+)', analysis, re.IGNORECASE)
+    if progress_match:
+        stats['in_progress_count'] = int(progress_match.group(1) or progress_match.group(2))
+
+    # Look for "Total: 12 tickets" or similar
+    total_match = re.search(r'Total:\s*(\d+)', analysis, re.IGNORECASE)
+    if total_match:
+        stats['total_count'] = int(total_match.group(1))
+
+    # Look for completion percentage
+    pct_match = re.search(r'(\d+)%\s*(?:complete|done)', analysis, re.IGNORECASE)
+    if pct_match:
+        stats['completion_pct'] = int(pct_match.group(1))
+
+    # Look for unassigned tickets
+    unassigned_match = re.search(r'(\d+)\s+unassigned', analysis, re.IGNORECASE)
+    if unassigned_match:
+        stats['unassigned_count'] = int(unassigned_match.group(1))
+
+    # Look for blockers in the first 2000 chars (usually near the top)
+    blocker_section = analysis[:2000]
+    blocker_match = re.search(r'(?:blocker|blocked)[:\s]+([A-Z]+-\d+)', blocker_section, re.IGNORECASE)
+    if blocker_match:
+        stats['blocker'] = blocker_match.group(1)
+
+    return stats
+
+
+def analyze_with_claude(summary_path: Path, output_path: Path) -> dict:
+    """Call claude CLI with embedded prompt + summary."""
+
+    # Check if claude CLI exists
+    if not shutil.which("claude"):
+        print("\nError: 'claude' CLI not found", file=sys.stderr)
+        print("\nTo use automatic analysis, install Claude Code:", file=sys.stderr)
+        print("  https://claude.com/code", file=sys.stderr)
+        print("\nYou can still view the formatted summary:", file=sys.stderr)
+        print(f"  cat {summary_path}", file=sys.stderr)
+        print("\nOr analyze manually:", file=sys.stderr)
+        print(f"  cat {summary_path} | pbcopy", file=sys.stderr)
+        print("  # Then paste into Claude at claude.ai", file=sys.stderr)
+        return None
+
+    print("\nAnalyzing with Claude...")
+    print("  (Streaming output...)\n")
+    print("─" * 80)
+
+    try:
+        # Build full prompt
+        full_prompt = f"{ANALYSIS_PROMPT}\n\n---\n\n{summary_path.read_text()}"
+
+        # Call claude with streaming output - pipe stdin, let stdout/stderr flow through
+        result = subprocess.run(
+            ["claude", "--print", "--model", "sonnet"],
+            input=full_prompt,
+            text=True,
+            check=True,
+            timeout=300  # 5 minute timeout
+            # No capture_output - this lets it stream to stdout directly
+        )
+
+        print("─" * 80)
+        print(f"\n  ✓ Analysis complete")
+
+        # The output was streamed to stdout, but we also need to save it
+        # Run again to capture for saving (uses cache, so it's instant)
+        result = subprocess.run(
+            ["claude", "--print", "--model", "sonnet"],
+            input=full_prompt,
+            text=True,
+            capture_output=True,
+            check=True,
+            timeout=30  # Should be instant due to cache
+        )
+
+        # Save output
+        output_path.write_text(result.stdout)
+
+        # Extract stats for quick summary
+        stats = extract_summary_stats(result.stdout)
+
+        return stats
+
+    except subprocess.TimeoutExpired:
+        print("Error: Claude analysis timed out after 5 minutes", file=sys.stderr)
+        return None
+    except subprocess.CalledProcessError as e:
+        print(f"Error running Claude analysis: {e.stderr}", file=sys.stderr)
+        return None
+    except Exception as e:
+        print(f"Unexpected error during analysis: {e}", file=sys.stderr)
+        return None
+
+
+def print_quick_summary(stats: dict, analysis_path: Path):
+    """Print quick summary to console."""
+    print(f"\nResults saved to: {analysis_path}")
+
+    if not stats:
+        return
+
+    print("\nQuick Summary:")
+
+    # Build bullet points from available stats
+    bullets = []
+
+    if stats.get('done_count') is not None and stats.get('total_count') is not None:
+        pct = stats.get('completion_pct', int(stats['done_count'] / stats['total_count'] * 100))
+        bullets.append(f"  • {stats['done_count']}/{stats['total_count']} tickets done ({pct}%)")
+    elif stats.get('done_count') is not None:
+        bullets.append(f"  • {stats['done_count']} tickets done")
+
+    if stats.get('in_progress_count'):
+        bullets.append(f"  • {stats['in_progress_count']} in progress")
+
+    if stats.get('unassigned_count'):
+        bullets.append(f"  • {stats['unassigned_count']} unassigned (need attention)")
+
+    if stats.get('blocker'):
+        bullets.append(f"  • 1 blocker: {stats['blocker']}")
+
+    for bullet in bullets:
+        print(bullet)
+
+    if not bullets:
+        print("  (Review full analysis for details)")
+
+    print(f"\nView full analysis: cat {analysis_path}")
+
+
+def main():
+    if len(sys.argv) != 2:
+        print("Usage: ./jirabot5000 <EPIC_KEY>")
+        print("Example: ./jirabot5000 VCDLD-970")
+        print("\nOptions:")
+        print("  JIRABOT_DOWNLOAD_ONLY=1  Download tickets only (no format/analysis)")
+        sys.exit(1)
+
+    epic_key = sys.argv[1]
+    download_only = os.environ.get('JIRABOT_DOWNLOAD_ONLY', '').lower() in ('1', 'true', 'yes')
+
+    # Load configuration
+    try:
+        config = load_config()
+        jira_instance = config['jira_instance']
+        email = config['email']
+
+        # Try config file first, then environment variable
+        api_token = config.get('api_token') or os.environ.get('JIRA_API_TOKEN')
+
+        if not api_token:
+            print("Error: api_token not found in config.json and JIRA_API_TOKEN environment variable not set")
+            print("\nAdd to config.json:")
+            print('  "api_token": "your-token-here"')
+            print("\nOr set environment variable:")
+            print('  export JIRA_API_TOKEN="your-token-here"')
+            sys.exit(1)
+
+        # Get output directory (defaults to current directory)
+        output_directory = Path(config.get('output_directory', '.'))
+
+    except FileNotFoundError:
+        print("Error: config.json not found")
+        sys.exit(1)
+    except KeyError as e:
+        print(f"Error: Missing required key in config.json: {e}")
+        print("\nRequired keys: jira_instance, email")
+        print("Optional: api_token (can use JIRA_API_TOKEN env var instead), output_directory (defaults to current directory)")
+        sys.exit(1)
+
+    print(f"Fetching epic {epic_key}...")
+
+    # Get epic details
+    try:
+        epic_data = get_epic_details(jira_instance, email, api_token, epic_key)
+        epic_summary = epic_data['fields']['summary']
+        print(f"  Found: \"{epic_summary}\"")
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching epic details: {e}")
+        sys.exit(1)
+
+    # Get tickets
+    print(f"  Fetching tickets...")
+    try:
+        tickets = get_tickets_in_epic(jira_instance, email, api_token, epic_key)
+        print(f"  ✓ Found {len(tickets)} ticket(s)")
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching tickets: {e}")
+        sys.exit(1)
+
+    # Create directory for the epic
+    epic_dir = output_directory / epic_key
+    epic_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save epic metadata
+    epic_file = epic_dir / f"{epic_key}.json"
+    with open(epic_file, 'w', encoding='utf-8') as f:
+        json.dump(epic_data, f, indent=2, ensure_ascii=False)
+
+    # Save each ticket as JSON
+    for issue in tickets:
+        ticket_key = issue['key']
+        ticket_file = epic_dir / f"{ticket_key}.json"
+        with open(ticket_file, 'w', encoding='utf-8') as f:
+            json.dump(issue, f, indent=2, ensure_ascii=False)
+
+    print(f"  ✓ Saved {len(tickets)} tickets to {epic_dir}/")
+
+    # If download-only mode, stop here
+    if download_only:
+        print(f"\nDone! (Download-only mode)")
+        print(f"\nTo format and analyze, run:")
+        print(f"  ./jirabot5000 {epic_key}")
+        return
+
+    # Format the epic
+    try:
+        summary_path = format_epic(epic_dir)
+    except Exception as e:
+        print(f"\nWarning: Formatting failed, but raw JSON is available in {epic_dir}/")
+        print(f"Error: {e}")
+        sys.exit(1)
+
+    # Prompt for analysis
+    if prompt_for_analysis():
+        analysis_path = epic_dir / "analysis.md"
+        stats = analyze_with_claude(summary_path, analysis_path)
+
+        if stats is not None:
+            print_quick_summary(stats, analysis_path)
+        else:
+            print("\nAnalysis skipped or failed.")
+            print(f"You can analyze manually:")
+            print(f"  cat {summary_path} | claude --print")
+    else:
+        print("\nAnalysis skipped.")
+        print(f"\nFormatted summary available at: {summary_path}")
+        print(f"\nTo analyze later:")
+        print(f"  cat {summary_path} | claude --print > {epic_dir}/analysis.md")
+
+
+if __name__ == '__main__':
+    main()
